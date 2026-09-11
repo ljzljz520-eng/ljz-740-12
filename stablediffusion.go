@@ -1,15 +1,29 @@
 package stablediffusion
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"sync"
 	"unsafe"
 
 	"github.com/example/stablediffusion/bindings"
 )
 
-// Context 表示stable-diffusion的上下文
+// ErrContextClosed 在已关闭的 Context 上执行操作时返回
+var ErrContextClosed = errors.New("stablediffusion: context is closed")
+
+// 编译期断言：Context 实现 io.Closer
+var _ io.Closer = (*Context)(nil)
+
+// Context 表示stable-diffusion的上下文。
+//
+// Context 实现 io.Closer：Close 幂等且并发安全，重复调用不会重复释放底层资源。
+// Context 不可复制（内含锁），请始终通过指针使用。
 type Context struct {
-	ctx *bindings.SdCtx
+	mu     sync.Mutex
+	ctx    *bindings.SdCtx
+	closed bool
 }
 
 // Image 表示生成的图像
@@ -244,12 +258,39 @@ func NewContext(options ContextOptions) (*Context, error) {
 	return &Context{ctx: ctx}, nil
 }
 
-// Free 释放上下文
-func (c *Context) Free() {
+// Close 释放上下文占用的底层资源，实现 io.Closer。
+//
+// Close 是幂等且并发安全的：第一次调用释放资源，
+// 之后的重复调用直接返回 nil，不会重复释放或崩溃。
+func (c *Context) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil
+	}
+	c.closed = true
 	if c.ctx != nil {
 		bindings.FreeSdCtx(c.ctx)
 		c.ctx = nil
 	}
+	return nil
+}
+
+// Free 释放上下文。
+//
+// Deprecated: 请使用 Close（幂等且并发安全）。Free 保留仅为兼容旧代码。
+func (c *Context) Free() {
+	_ = c.Close()
+}
+
+// rawCtx 返回底层 C 上下文；若上下文已关闭则返回 ErrContextClosed。
+func (c *Context) rawCtx() (*bindings.SdCtx, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.ctx == nil {
+		return nil, ErrContextClosed
+	}
+	return c.ctx, nil
 }
 
 // NewUpscaler 创建一个新的超分辨率器
@@ -302,6 +343,11 @@ func (u *Upscaler) GetUpscaleFactor() int {
 
 // GenerateImage 生成图像
 func (c *Context) GenerateImage(cfg GenerationConfig) ([]*Image, error) {
+	raw, err := c.rawCtx()
+	if err != nil {
+		return nil, err
+	}
+
 	// 初始化图像生成参数
 	params := &bindings.SdImgGenParams{}
 	bindings.SdImgGenParamsInit(params)
@@ -420,7 +466,7 @@ func (c *Context) GenerateImage(cfg GenerationConfig) ([]*Image, error) {
 	}
 
 	// 生成图像
-	result := bindings.GenerateImage(c.ctx, params)
+	result := bindings.GenerateImage(raw, params)
 	if result == nil {
 		return nil, fmt.Errorf("failed to generate image")
 	}
@@ -453,12 +499,24 @@ func ConvertModel(inputPath, vaePath, outputPath string, outputType bindings.SdT
 }
 
 // GetDefaultSampleMethod 获取默认采样方法
+// 若上下文已关闭，返回零值。
 func (c *Context) GetDefaultSampleMethod() bindings.SampleMethod {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.ctx == nil {
+		return 0
+	}
 	return bindings.GetDefaultSampleMethod(c.ctx)
 }
 
 // GetDefaultScheduler 获取默认调度器
+// 若上下文已关闭，返回零值。
 func (c *Context) GetDefaultScheduler(method bindings.SampleMethod) bindings.Scheduler {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.ctx == nil {
+		return 0
+	}
 	return bindings.GetDefaultScheduler(c.ctx, method)
 }
 
@@ -524,6 +582,11 @@ type VideoGenerationConfig struct {
 
 // GenerateVideo 生成视频
 func (c *Context) GenerateVideo(cfg VideoGenerationConfig) ([]*Image, error) {
+	raw, err := c.rawCtx()
+	if err != nil {
+		return nil, err
+	}
+
 	params := &bindings.SdVidGenParams{}
 	bindings.SdVidGenParamsInit(params)
 
@@ -606,7 +669,7 @@ func (c *Context) GenerateVideo(cfg VideoGenerationConfig) ([]*Image, error) {
 
 	// 生成视频
 	var numFramesOut int
-	result := bindings.GenerateVideo(c.ctx, params, &numFramesOut)
+	result := bindings.GenerateVideo(raw, params, &numFramesOut)
 	if result == nil || numFramesOut == 0 {
 		return nil, fmt.Errorf("failed to generate video")
 	}
