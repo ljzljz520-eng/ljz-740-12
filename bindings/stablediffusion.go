@@ -104,7 +104,7 @@ const (
 	TCD_SAMPLE_METHOD
 	RES_MULTISTEP_SAMPLE_METHOD
 	RES_2S_SAMPLE_METHOD
-	SAMPLE_METHOD = iota // Added to match header logic if needed, but SAMPLE_METHOD_COUNT is usually last
+	SAMPLE_METHOD       = iota // Added to match header logic if needed, but SAMPLE_METHOD_COUNT is usually last
 	SAMPLE_METHOD_COUNT = RES_2S_SAMPLE_METHOD + 1
 
 	// Scheduler
@@ -195,12 +195,12 @@ const (
 
 // 结构体定义
 type SdTilingParams struct {
-	Enabled        bool
-	TileSizeX      int
-	TileSizeY      int
-	TargetOverlap  float32
-	RelSizeX       float32
-	RelSizeY       float32
+	Enabled       bool
+	TileSizeX     int
+	TileSizeY     int
+	TargetOverlap float32
+	RelSizeX      float32
+	RelSizeY      float32
 }
 
 type SdEmbedding struct {
@@ -420,8 +420,8 @@ var (
 	freeSdCtx func(ctx *SdCtx)
 
 	// 采样参数初始化
-	sdSampleParamsInit   func(params *SdSampleParams)
-	sdSampleParamsToStr  func(params *SdSampleParams) *byte
+	sdSampleParamsInit  func(params *SdSampleParams)
+	sdSampleParamsToStr func(params *SdSampleParams) *byte
 
 	// 获取默认采样方法和调度器
 	sdGetDefaultSampleMethod func(ctx *SdCtx) SampleMethod
@@ -525,9 +525,14 @@ func setMockImplementations() {
 		return 10
 	}
 
-	// 模拟上下文创建函数
+	// 模拟上下文创建函数：
+	// 仅当提供了模型路径时返回非 nil 句柄，便于在没有动态库的环境下
+	// 演示/测试资源的创建与释放流程；否则返回 nil 模拟加载失败。
 	newSdCtx = func(params *SdCtxParams) *SdCtx {
-		return nil
+		if params == nil || params.ModelPath == nil {
+			return nil
+		}
+		return &SdCtx{}
 	}
 
 	// 模拟其他函数
@@ -639,17 +644,17 @@ func GoString(c *byte) string {
 	if c == nil {
 		return ""
 	}
-	// 关键修复：正确计算字符串长度直到 NULL
-	var length int
-	p := uintptr(unsafe.Pointer(c))
-	for {
-		if *(*byte)(unsafe.Pointer(p)) == 0 {
-			break
-		}
-		length++
-		p++
+	// 关键修复：正确计算字符串长度直到 NULL。
+	// 必须基于原始指针用 unsafe.Add 逐字节扫描（checkptr 安全）：
+	// 不能先转成 uintptr 再加偏移再转回 unsafe.Pointer —— 当底层是 Go
+	// 分配时会被 checkptr 判定为非法指针运算（-race 下 fatal）。
+	// 底层为原生 C 指针时，checkptr 不参与校验；底层为 Go 分配时，
+	// CString 保证 NUL 在分配范围内，扫描不会越界。
+	n := 0
+	for *(*byte)(unsafe.Add(unsafe.Pointer(c), n)) != 0 {
+		n++
 	}
-	return unsafe.String(c, length)
+	return unsafe.String(c, n)
 }
 
 // 公开的API函数

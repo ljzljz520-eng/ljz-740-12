@@ -268,3 +268,46 @@ ok  github.com/example/stablediffusion/test
 | `PORT` | HTTP 服务端口 | `8080` |
 | `HOST` | HTTP 监听地址 | `0.0.0.0` |
 | `GENERATE_TIMEOUT` | 生成超时时间 | `5m` |
+
+---
+
+## 🧩 模型上下文的创建与释放（推荐）
+
+使用 `OpenModel` 只需传 4 个参数：模型路径、线程数、量化选项、是否使用 VAE。
+返回的 `*Model` 实现了 `io.Closer`，**`Close` 是幂等且并发安全的**——重复调用不会
+重复释放也不会 panic，可放心配合 `defer` 使用；即使忘记关闭，GC finalizer 也会兜底释放。
+
+```go
+package main
+
+import (
+	"log"
+
+	sd "github.com/example/stablediffusion"
+	"github.com/example/stablediffusion/bindings"
+)
+
+func main() {
+	model, err := sd.OpenModel(sd.ModelOptions{
+		ModelPath:    "models/sd-v1-5.gguf",  // 模型路径（必填）
+		Threads:      4,                      // 线程数；<=0 自动
+		Quantization: bindings.SD_TYPE_Q8_0,  // 权重量化类型
+		UseVAE:       true,                   // 是否允许 VAE 解码
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer model.Close() // 函数退出时释放 native 资源
+
+	if _, err := model.GenerateImage(sd.GenerationConfig{Prompt: "a cat"}); err != nil {
+		log.Printf("generate: %v", err)
+	}
+}
+```
+
+完整可运行示例见 [`examples/model-lifecycle`](examples/model-lifecycle/main.go)，其中演示了
+`defer` 释放以及多次 `Close` 不崩溃。
+
+关闭后继续使用会返回 `ErrClosed`（可用 `errors.Is` 判断）；`UseVAE=false` 时调用
+`GenerateImage` 返回 `ErrVAEDisabled`。旧的 `NewContext` + `Free` 接口仍可用，
+`Context.Free()` 已等价于幂等的 `Context.Close()`。

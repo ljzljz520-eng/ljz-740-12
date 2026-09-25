@@ -2,14 +2,22 @@ package stablediffusion
 
 import (
 	"fmt"
+	"runtime"
+	"sync"
 	"unsafe"
 
 	"github.com/example/stablediffusion/bindings"
 )
 
-// Context 表示stable-diffusion的上下文
+// Context 表示stable-diffusion的上下文，持有 native 资源。
+//
+// 它实现了 io.Closer：Close 是幂等且并发安全的，重复 Close 不会重复释放、
+// 也不会 panic，可直接配合 defer 使用。释放后继续调用生成类方法会返回
+// ErrClosed。
 type Context struct {
-	ctx *bindings.SdCtx
+	mu   sync.RWMutex
+	once sync.Once
+	ctx  *bindings.SdCtx
 }
 
 // Image 表示生成的图像
@@ -146,9 +154,9 @@ type ContextOptions struct {
 // DefaultContextOptions 返回具有默认参数的上下文选项
 func DefaultContextOptions(modelPath string) ContextOptions {
 	return ContextOptions{
-		ModelPath: modelPath,
-		NThreads:  -1, // 自动
-		Wtype:     bindings.SD_TYPE_F16,
+		ModelPath:  modelPath,
+		NThreads:   -1, // 自动
+		Wtype:      bindings.SD_TYPE_F16,
 		EnableMmap: true,
 	}
 }
@@ -241,15 +249,49 @@ func NewContext(options ContextOptions) (*Context, error) {
 		return nil, fmt.Errorf("failed to create context")
 	}
 
-	return &Context{ctx: ctx}, nil
+	c := &Context{ctx: ctx}
+	// 兜底：即使调用方忘记 Close，GC 回收时也会释放 native 资源。
+	// 显式 Close 后 finalizer 会被清除，不会重复释放。
+	runtime.SetFinalizer(c, func(c *Context) { _ = c.Close() })
+	return c, nil
 }
 
-// Free 释放上下文
-func (c *Context) Free() {
-	if c.ctx != nil {
-		bindings.FreeSdCtx(c.ctx)
-		c.ctx = nil
+// Close 释放上下文占用的 native 资源，实现 io.Closer。
+//
+// Close 是幂等且并发安全的：第一次调用真正释放，后续调用直接返回 nil，
+// 重复调用不会重复释放、也不会 panic。对 nil *Context 调用同样安全。
+func (c *Context) Close() error {
+	if c == nil {
+		return nil
 	}
+	c.once.Do(func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.ctx != nil {
+			bindings.FreeSdCtx(c.ctx)
+			c.ctx = nil
+		}
+		// 已显式释放，取消 GC 兜底，避免重复释放
+		runtime.SetFinalizer(c, nil)
+	})
+	return nil
+}
+
+// Free 释放上下文。
+//
+// 已废弃：请改用 Close（幂等，可实现 defer ctx.Close()）。保留该方法仅为兼容旧代码。
+func (c *Context) Free() {
+	_ = c.Close()
+}
+
+// Closed 报告上下文是否已关闭（native 资源已释放）。
+func (c *Context) Closed() bool {
+	if c == nil {
+		return true
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.ctx == nil
 }
 
 // NewUpscaler 创建一个新的超分辨率器
@@ -302,6 +344,12 @@ func (u *Upscaler) GetUpscaleFactor() int {
 
 // GenerateImage 生成图像
 func (c *Context) GenerateImage(cfg GenerationConfig) ([]*Image, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.ctx == nil {
+		return nil, ErrClosed
+	}
+
 	// 初始化图像生成参数
 	params := &bindings.SdImgGenParams{}
 	bindings.SdImgGenParamsInit(params)
@@ -452,13 +500,23 @@ func ConvertModel(inputPath, vaePath, outputPath string, outputType bindings.SdT
 	return nil
 }
 
-// GetDefaultSampleMethod 获取默认采样方法
+// GetDefaultSampleMethod 获取默认采样方法。上下文已关闭时返回零值。
 func (c *Context) GetDefaultSampleMethod() bindings.SampleMethod {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.ctx == nil {
+		return 0
+	}
 	return bindings.GetDefaultSampleMethod(c.ctx)
 }
 
-// GetDefaultScheduler 获取默认调度器
+// GetDefaultScheduler 获取默认调度器。上下文已关闭时返回零值。
 func (c *Context) GetDefaultScheduler(method bindings.SampleMethod) bindings.Scheduler {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.ctx == nil {
+		return 0
+	}
 	return bindings.GetDefaultScheduler(c.ctx, method)
 }
 
@@ -504,26 +562,32 @@ func PreprocessCanny(img *Image, highThreshold, lowThreshold, weak, strong float
 
 // VideoGenerationConfig 表示视频生成配置
 type VideoGenerationConfig struct {
-	Prompt                string
-	NegativePrompt        string
-	Width                 int
-	Height                int
-	Seed                  int64
-	Strength              float32
-	ClipSkip              int
-	Loras                 []Lora
-	ControlFrames         []Image
-	InitImage             *Image
-	EndImage              *Image
-	VideoFrames           int
-	MoeBoundary           float32
-	VaceStrength          float32
-	Sampler               SamplerConfig
-	HighNoiseSampler      SamplerConfig
+	Prompt           string
+	NegativePrompt   string
+	Width            int
+	Height           int
+	Seed             int64
+	Strength         float32
+	ClipSkip         int
+	Loras            []Lora
+	ControlFrames    []Image
+	InitImage        *Image
+	EndImage         *Image
+	VideoFrames      int
+	MoeBoundary      float32
+	VaceStrength     float32
+	Sampler          SamplerConfig
+	HighNoiseSampler SamplerConfig
 }
 
 // GenerateVideo 生成视频
 func (c *Context) GenerateVideo(cfg VideoGenerationConfig) ([]*Image, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.ctx == nil {
+		return nil, ErrClosed
+	}
+
 	params := &bindings.SdVidGenParams{}
 	bindings.SdVidGenParamsInit(params)
 
