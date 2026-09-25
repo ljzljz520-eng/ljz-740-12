@@ -1,15 +1,29 @@
 package stablediffusion
 
 import (
+	"errors"
 	"fmt"
+	"sync"
 	"unsafe"
 
 	"github.com/example/stablediffusion/bindings"
 )
 
+// errClosed 在上下文已经被释放后继续使用时返回
+var errClosed = errors.New("stablediffusion: context has already been closed")
+
 // Context 表示stable-diffusion的上下文
+//
+// Context 持有底层 C 侧分配的模型资源，使用完毕后必须调用 Close（或 Free）
+// 释放。Close 可以被重复调用，也允许在 nil 指针上调用，均不会崩溃。
+// Context 的方法在内部通过读写锁与 Close 互斥：生成等操作进行期间，
+// Close 会等待其结束，避免释放正在被使用的资源。
 type Context struct {
 	ctx *bindings.SdCtx
+
+	// mu 保护 ctx 与 closed：生成类操作持有读锁，Close 持有写锁
+	mu     sync.RWMutex
+	closed bool
 }
 
 // Image 表示生成的图像
@@ -93,8 +107,13 @@ type GenerationConfig struct {
 }
 
 // Upscaler 表示超分辨率器
+//
+// 与 Context 一样，Upscaler 持有底层资源，Close/Free 可重复调用且 nil 安全。
 type Upscaler struct {
 	ctx *bindings.UpscalerCtx
+
+	mu     sync.RWMutex
+	closed bool
 }
 
 // ContextOptions 定义了stable-diffusion上下文的完整配置参数
@@ -238,18 +257,133 @@ func NewContext(options ContextOptions) (*Context, error) {
 	// 创建上下文
 	ctx := bindings.CreateSdCtx(params)
 	if ctx == nil {
-		return nil, fmt.Errorf("failed to create context")
+		return nil, fmt.Errorf("failed to create context (model path: %q, wtype: %s)",
+			options.ModelPath, bindings.GetTypeName(options.Wtype))
 	}
 
 	return &Context{ctx: ctx}, nil
 }
 
 // Free 释放上下文
+//
+// Free 是 Close 的别名，保持向后兼容。重复调用是安全的，不会二次释放
+// 底层资源；在 nil 的 *Context 上调用同样安全。
 func (c *Context) Free() {
+	c.Close()
+}
+
+// Close 释放上下文持有的底层模型资源。
+//
+// Close 满足 io.Closer 接口，具备以下保证：
+//   - 可被重复调用：只有第一次调用会真正释放底层资源，之后的调用直接返回 nil；
+//   - nil 安全：在 nil 的 *Context 上调用不会 panic（返回 nil）；
+//   - 并发安全：与 GenerateImage / GenerateVideo 等正在使用上下文的操作互斥，
+//     Close 会等待这些操作结束后再释放资源。
+func (c *Context) Close() error {
+	if c == nil {
+		return nil
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return nil
+	}
 	if c.ctx != nil {
 		bindings.FreeSdCtx(c.ctx)
 		c.ctx = nil
 	}
+	c.closed = true
+	return nil
+}
+
+// Closed 返回上下文是否已经被释放。
+func (c *Context) Closed() bool {
+	if c == nil {
+		return true
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.closed
+}
+
+// aliveLocked 在持有读锁（或写锁）的情况下返回上下文是否仍然可用。
+func (c *Context) aliveLocked() bool {
+	return c != nil && !c.closed && c.ctx != nil
+}
+
+// ModelConfig 是创建模型上下文所需的精简配置，面向最常见的使用场景。
+//
+// 复杂模型（SDXL/Flux/视频模型等多文件组合、LoRA、缓存策略等）仍然可以
+// 通过 ContextOptions + NewContext 配置。
+type ModelConfig struct {
+	// ModelPath 模型文件路径（必填），例如 ./models/sd-v1-5.gguf
+	ModelPath string
+
+	// Threads 推理使用的线程数。<= 0 表示由底层库自动选择（通常为物理核心数）。
+	Threads int
+
+	// Quantization 权重量化/精度类型，例如 bindings.SD_TYPE_F16、
+	// bindings.SD_TYPE_Q8_0、bindings.SD_TYPE_Q4_K 等。
+	// 零值（SD_TYPE_F32 之外的默认场景）若不确定可直接传 bindings.SD_TYPE_F16。
+	Quantization bindings.SdType
+
+	// UseVAE 是否加载并使用完整 VAE 进行解码：
+	//   true  —— 正常模式，生成后使用 VAE 解码出最终图像（默认，绝大多数场景）；
+	//   false —— 预览模式，不依赖完整 VAE（tae_preview_only），只输出 TAESD
+	//            快速预览，适合不需要最终成图的调试场景。
+	UseVAE bool
+}
+
+// Model 是一个可关闭（io.Closer）的模型上下文句柄。
+//
+// 通过 OpenModel 创建，使用 defer model.Close() 即可保证底层模型资源被释放；
+// 重复 Close 不会崩溃。生成图像/视频等操作通过内嵌的 *Context 进行。
+type Model struct {
+	*Context
+}
+
+// OpenModel 按精简参数加载模型，返回可关闭的模型对象。
+//
+// 参数：
+//   - modelPath:    模型文件路径；
+//   - threads:      推理线程数，<= 0 表示自动；
+//   - quantization: 量化/精度类型（如 bindings.SD_TYPE_F16、SD_TYPE_Q8_0）；
+//   - useVAE:       是否使用完整 VAE 解码（false 时仅输出 TAESD 快速预览）。
+//
+// 加载失败时返回非 nil 的 error，且不会泄漏已分配的资源。
+func OpenModel(modelPath string, threads int, quantization bindings.SdType, useVAE bool) (*Model, error) {
+	if modelPath == "" {
+		return nil, errors.New("stablediffusion: model path is empty")
+	}
+
+	opts := DefaultContextOptions(modelPath)
+	opts.NThreads = threads
+	opts.Wtype = quantization
+	// tae_preview_only 与“使用 VAE”语义相反：
+	// 不使用完整 VAE 时，仅保留 TAESD 快速预览通路。
+	opts.TaePreviewOnly = !useVAE
+	opts.VaeDecodeOnly = useVAE // 使用 VAE 时只做解码（跳过编码），是纯文生图/图生图的常规选择
+
+	ctx, err := NewContext(opts)
+	if err != nil {
+		return nil, err
+	}
+	return &Model{Context: ctx}, nil
+}
+
+// Close 释放模型资源。重复调用以及在 nil 的 *Model 上调用都是安全的。
+func (m *Model) Close() error {
+	if m == nil || m.Context == nil {
+		return nil
+	}
+	return m.Context.Close()
+}
+
+// Free 是 Close 的别名，保持与项目既有 API 命名一致。
+func (m *Model) Free() {
+	_ = m.Close()
 }
 
 // NewUpscaler 创建一个新的超分辨率器
@@ -262,16 +396,59 @@ func NewUpscaler(modelPath string) (*Upscaler, error) {
 	return &Upscaler{ctx: ctx}, nil
 }
 
-// Free 释放超分辨率器
+// Free 释放超分辨率器（Close 的别名，重复调用安全）。
 func (u *Upscaler) Free() {
+	_ = u.Close()
+}
+
+// Close 释放超分辨率器持有的底层资源。
+// 重复调用、在 nil 的 *Upscaler 上调用均不会崩溃。
+func (u *Upscaler) Close() error {
+	if u == nil {
+		return nil
+	}
+
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if u.closed {
+		return nil
+	}
 	if u.ctx != nil {
 		bindings.FreeUpscalerCtx(u.ctx)
 		u.ctx = nil
 	}
+	u.closed = true
+	return nil
+}
+
+// Closed 返回超分辨率器是否已经被释放。
+func (u *Upscaler) Closed() bool {
+	if u == nil {
+		return true
+	}
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	return u.closed
+}
+
+// aliveLocked 在持有锁的情况下返回超分辨率器是否仍然可用。
+func (u *Upscaler) aliveLocked() bool {
+	return u != nil && !u.closed && u.ctx != nil
 }
 
 // Upscale 执行超分辨率
 func (u *Upscaler) Upscale(img *Image, factor uint32) (*Image, error) {
+	if img == nil || len(img.Data) == 0 {
+		return nil, errors.New("stablediffusion: input image is nil or empty")
+	}
+
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	if !u.aliveLocked() {
+		return nil, errClosed
+	}
+
 	// 转换为绑定的图像类型
 	input := bindings.SdImage{
 		Width:   img.Width,
@@ -297,11 +474,23 @@ func (u *Upscaler) Upscale(img *Image, factor uint32) (*Image, error) {
 
 // GetUpscaleFactor 获取超分辨率因子
 func (u *Upscaler) GetUpscaleFactor() int {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	if !u.aliveLocked() {
+		return 0
+	}
 	return bindings.GetUpscaleFactor(u.ctx)
 }
 
 // GenerateImage 生成图像
 func (c *Context) GenerateImage(cfg GenerationConfig) ([]*Image, error) {
+	// 持有读锁直到生成结束：与 Close 的写锁互斥，避免释放正在使用的上下文
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if !c.aliveLocked() {
+		return nil, errClosed
+	}
+
 	// 初始化图像生成参数
 	params := &bindings.SdImgGenParams{}
 	bindings.SdImgGenParamsInit(params)
@@ -454,11 +643,21 @@ func ConvertModel(inputPath, vaePath, outputPath string, outputType bindings.SdT
 
 // GetDefaultSampleMethod 获取默认采样方法
 func (c *Context) GetDefaultSampleMethod() bindings.SampleMethod {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if !c.aliveLocked() {
+		return bindings.EULER_SAMPLE_METHOD
+	}
 	return bindings.GetDefaultSampleMethod(c.ctx)
 }
 
 // GetDefaultScheduler 获取默认调度器
 func (c *Context) GetDefaultScheduler(method bindings.SampleMethod) bindings.Scheduler {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if !c.aliveLocked() {
+		return bindings.DISCRETE_SCHEDULER
+	}
 	return bindings.GetDefaultScheduler(c.ctx, method)
 }
 
@@ -524,6 +723,13 @@ type VideoGenerationConfig struct {
 
 // GenerateVideo 生成视频
 func (c *Context) GenerateVideo(cfg VideoGenerationConfig) ([]*Image, error) {
+	// 持有读锁直到生成结束：与 Close 的写锁互斥，避免释放正在使用的上下文
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if !c.aliveLocked() {
+		return nil, errClosed
+	}
+
 	params := &bindings.SdVidGenParams{}
 	bindings.SdVidGenParamsInit(params)
 

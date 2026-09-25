@@ -105,3 +105,114 @@ func TestImageGenerationConfig(t *testing.T) {
 	
 	t.Logf("Image generation config created successfully")
 }
+
+// 测试用例2.7：OpenModel 参数校验
+func TestOpenModelEmptyPath(t *testing.T) {
+	_, err := stablediffusion.OpenModel("", 4, 1, true)
+	if err == nil {
+		t.Fatal("空模型路径应当返回错误")
+	}
+	t.Logf("空路径错误: %v", err)
+}
+
+// 测试用例2.8：OpenModel 在无真实模型时返回错误且不泄漏资源
+func TestOpenModelMissingFile(t *testing.T) {
+	// 1 == SD_TYPE_F16；无论是否加载了动态库，不存在的模型文件都应失败
+	model, err := stablediffusion.OpenModel("definitely-missing-model.gguf", 2, 1, true)
+	if err == nil {
+		// 极端情况下底层返回了句柄，也要保证测试结束时释放
+		defer model.Close()
+		t.Fatalf("不存在的模型文件不应创建成功")
+	}
+	if model != nil {
+		t.Fatalf("创建失败时不应返回模型对象")
+	}
+}
+
+// 测试用例2.9：Context 的 Close 幂等、nil 安全、并发安全
+func TestContextCloseIdempotent(t *testing.T) {
+	// nil 指针上调用 Close 不应 panic
+	var nilCtx *stablediffusion.Context
+	if err := nilCtx.Close(); err != nil {
+		t.Fatalf("nil Context Close 应返回 nil, 实际 %v", err)
+	}
+	if !nilCtx.Closed() {
+		t.Fatal("nil Context 应视为已关闭")
+	}
+
+	// 零值 Context（底层句柄为 nil）用于验证释放路径本身不会二次释放
+	ctx := &stablediffusion.Context{}
+	for i := 0; i < 3; i++ {
+		if err := ctx.Close(); err != nil {
+			t.Fatalf("第 %d 次 Close 返回错误: %v", i+1, err)
+		}
+		if !ctx.Closed() {
+			t.Fatalf("第 %d 次 Close 后 Closed() 应为 true", i+1)
+		}
+	}
+
+	// Free（Close 别名）再调用一次也不应崩溃
+	ctx.Free()
+
+	// 关闭后继续使用应返回错误而不是段错误
+	if _, err := ctx.GenerateImage(stablediffusion.GenerationConfig{}); err == nil {
+		t.Fatal("已关闭的 Context 生成图像应返回错误")
+	}
+	if _, err := ctx.GenerateVideo(stablediffusion.VideoGenerationConfig{}); err == nil {
+		t.Fatal("已关闭的 Context 生成视频应返回错误")
+	}
+
+	// 并发 Close 不应 panic / 死锁
+	ctx2 := &stablediffusion.Context{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 50; i++ {
+			_ = ctx2.Close()
+		}
+	}()
+	for i := 0; i < 50; i++ {
+		_ = ctx2.Close()
+	}
+	<-done
+}
+
+// 测试用例2.10：Upscaler 的 Close 同样幂等且 nil 安全
+func TestUpscalerCloseIdempotent(t *testing.T) {
+	var nilUpscaler *stablediffusion.Upscaler
+	if err := nilUpscaler.Close(); err != nil {
+		t.Fatalf("nil Upscaler Close 应返回 nil, 实际 %v", err)
+	}
+
+	u := &stablediffusion.Upscaler{}
+	for i := 0; i < 3; i++ {
+		if err := u.Close(); err != nil {
+			t.Fatalf("第 %d 次 Close 返回错误: %v", i+1, err)
+		}
+	}
+	u.Free() // 别名再调用一次
+
+	if factor := u.GetUpscaleFactor(); factor != 0 {
+		t.Fatalf("已关闭的 Upscaler 应返回 0 倍率, 实际 %d", factor)
+	}
+	if _, err := u.Upscale(&stablediffusion.Image{Width: 1, Height: 1, Channel: 3, Data: make([]byte, 3)}, 2); err == nil {
+		t.Fatal("已关闭的 Upscaler 执行放大应返回错误")
+	}
+}
+
+// 测试用例2.11：Model 的 Close nil 安全（成功创建路径由集成环境覆盖）
+func TestModelCloseNilSafe(t *testing.T) {
+	var m *stablediffusion.Model
+	if err := m.Close(); err != nil {
+		t.Fatalf("nil Model Close 应返回 nil, 实际 %v", err)
+	}
+	m.Free()
+
+	empty := &stablediffusion.Model{}
+	if err := empty.Close(); err != nil {
+		t.Fatalf("空 Model Close 应返回 nil, 实际 %v", err)
+	}
+	if err := empty.Close(); err != nil {
+		t.Fatalf("重复 Close 应返回 nil, 实际 %v", err)
+	}
+}

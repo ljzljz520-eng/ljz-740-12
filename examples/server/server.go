@@ -255,10 +255,12 @@ func main() {
 		log.Fatalf("Server forced to shutdown: %v", err)
 	}
 
-	// 释放模型资源
+	// 释放模型资源（Close 幂等，重复调用也不会崩溃）
 	if sdCtx != nil {
 		log.Println("Freeing stable-diffusion context...")
-		sdCtx.Free()
+		if err := sdCtx.Close(); err != nil {
+			log.Printf("关闭上下文时出错: %v", err)
+		}
 	}
 
 	log.Println("Server exiting")
